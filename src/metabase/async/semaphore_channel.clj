@@ -1,6 +1,8 @@
 (ns metabase.async.semaphore-channel
   (:require [clojure.core.async :as a]
             [clojure.tools.logging :as log]
+            [metabase.async.util :as async.u]
+            [metabase.util :as u]
             [metabase.util.i18n :refer [trs]])
   (:import java.io.Closeable
            java.lang.ref.WeakReference))
@@ -19,105 +21,121 @@
             (return! id)))
         nil))))
 
+(defn- new-permit! [{:keys [id-counter closed-permits-in-chan permits weak-refs]}]
+  (let [id       (swap! id-counter inc)
+        permit   (permit id #(a/>!! closed-permits-in-chan %))
+        weak-ref (WeakReference. permit)]
+    (log/debug (trs "Created {0}" permit))
+    (swap! weak-refs assoc id weak-ref)
+    (a/>!! permits permit)
+    nil))
+
+(defn- handle-closed-permits
+  "loop to handle returned permits"
+  [{:keys [closed-permits-in-chan weak-refs], :as context}]
+  (a/go-loop []
+      (let [id    (a/<! closed-permits-in-chan)
+            [old] (swap-vals! weak-refs dissoc id)]
+        (when (get old id)
+          (log/debug (trs "Permit {0} returned nicely" id))
+          (new-permit! context)))
+      (recur)))
+
+(defn- cleanup-orphaned-permits [{:keys [weak-refs], :as context}]
+  (log/debug (trs "Initiating clean up of orphaned permits. Total weak refs: {0}" (count @weak-refs)))
+  (doseq [[id, ^WeakReference weak-ref] @weak-refs]
+    (log/debug (trs "Check permit {0} orphaned? {1}" id (nil? (.get weak-ref))))
+    (when-not (.get weak-ref)
+      (log/warn (trs "Warning: orphaned Permit {0} recovered. Make sure to close permits when done!" id))
+      (let [[old] (swap-vals! weak-refs dissoc id)]
+        (when (get old id)
+          (new-permit! context))))))
+
+(defn- furnish-available-permits
+  "loop to take returned permits and make them available to the `out` channel consumed elsewhere, or to clean up"
+  [{:keys [available-permits-out-chan permits weak-refs], :as context}]
+  (a/go-loop [permit (a/poll! permits)]
+    (if permit
+      (do
+        (a/>! available-permits-out-chan permit)
+        (recur (a/poll! permits)))
+      ;; Out of permits. Cleanup time!
+      (do
+        (cleanup-orphaned-permits context)
+        (recur (a/<! permits))))))
+
+
 (defn semaphore-channel
   "Create a new channel that acts as a counting semaphore, containing `n` permits. Use `<!` or the like to get a permit
   from the semaphore channel. The permit should be returned by calling `.close` or by using `with-open`."
   [n]
-  (let [weak-refs  (atom {})
-        permits    (a/chan n)
-        id-counter (atom 0)
-        in         (a/chan n)
-        out        (a/chan 1)
-
-        create-new-permit!
-        (fn []
-          (let [id       (swap! id-counter inc)
-                permit   (permit id #(a/>!! in %))
-                weak-ref (WeakReference. permit)]
-            (log/debug (trs "Created {0}" permit))
-            (swap! weak-refs assoc id weak-ref)
-            (a/>!! permits permit)
-            nil))]
-
-
+  (let [context {:id-counter                 (atom 0)
+                 :weak-refs                  (atom {})
+                 :permits                    (a/chan n)
+                 :closed-permits-in-chan     (a/chan n)
+                 :available-permits-out-chan (a/chan 1)}]
+    ;; load the semaphore channel with the initial n permits
     (dotimes [_ n]
-      (create-new-permit!))
+      (new-permit! context))
+    ;; start loops that will take in closed permits, and another that will send them back out, scavenging for orphaned
+    ;; permits if none are available
+    (handle-closed-permits context)
+    (furnish-available-permits context)
+    (:available-permits-out-chan context)))
 
-    ;; loop to handle returned permits
-    (a/go-loop [id (a/<! in)]
-      (log/debug (trs "Permit {0} returned nicely" id))
-      (let [[old] (swap-vals! weak-refs dissoc id)]
-        (when (get old id)
-          (create-new-permit!)))
-      (recur (a/<! in)))
 
-    ;; loop to take returned permits and make them available to the `out` channel consumed elsewhere, or to clean up
-    (a/go-loop [permit (a/poll! permits)]
-      (if permit
-        (do
-          (a/>! out permit)
-          (recur (a/poll! permits)))
+;;; ------------------------------------------- do-after-receiving-permit --------------------------------------------
 
-        ;; Out of permits. Cleanup time!
-        (do
-          (log/debug (trs "Initiating clean up of abandoned permits. Total weak refs: {0}/{1}" (count @weak-refs) n))
-          (doseq [[id, ^WeakReference weak-ref] @weak-refs]
-            (log/debug (trs "Check permit {0} abandoned? {1}" id (nil? (.get weak-ref))))
-            (when-not (.get weak-ref)
-              (log/warn (trs "Warning: abandoned Permit {0} recovered. Make sure you're closing permits when done." id))
-              (let [[old] (swap-vals! weak-refs dissoc id)]
-                (when (get old id)
-                  (create-new-permit!)))))
-          (recur (a/<! permits)))))
+(def ^:private ^:dynamic *permits* nil)
 
-    out))
+(defn- do-f-with-permit
+  "Once a `permit` is obtained, execute `(apply f args)`, writing the results to `output-chan`, and returning the permit
+  no matter what."
+  [permit out-chan f & args]
+  (log/debug (trs "Obtained {0}" permit))
+  (try
+    (let [f (fn []
+              (with-open [permit permit]
+                (try
+                  (u/prog1 (apply f args)
+                    (log/debug (trs "(f) finished, permit will be returned")))
+                  (catch Throwable e
+                    (log/error e "Caught unexpected exception")
+                    e))))]
+      (a/go
+        (when (a/<! (async.u/single-value-pipe (async.u/do-on-separate-thread f) out-chan))
+          (log/debug "request canceled, permit will be returned")
+          (.close permit))))
+    (catch Throwable e
+      (log/error e (trs "Unexpected error attempting to run function after obtaining permit"))
+      (a/>! out-chan e)
+      (.close permit))))
 
-(defn- closed-or-has-message?
-  "True if a core.async channel is open and doesn't have any messages ready."
-  ;; Check whether the channel is closed by attempting to take a value from it. If channel is already closed `alts!!`
-  ;; will return `nil`. Otherwise if it already has a value, unless you are trying to intentionally break things, it
-  ;; won't be `::open`.
-  [chan]
-  (let [[v _] (a/alts!! [chan] :default ::open)]
-    (not= v ::open)))
+(defn- do-after-waiting-for-new-permit [semaphore-chan f & args]
+  (let [out-chan (a/chan 1)]
+    ;; fire off a go block to wait for a permit.
+    (a/go
+      (let [[permit first-done] (a/alts! [semaphore-chan out-chan])]
+        (binding [*permits* (assoc *permits* semaphore-chan permit)]
+          ;; If out-chan closes before we get a permit, there's nothing for us to do here. Otherwise if we got our
+          ;; permit then proceed
+          (if (= first-done out-chan)
+            (log/debug (trs "Not running pending function call: output channel already closed."))
+            ;; otherwise if channel is still open run the function
+            (apply do-f-with-permit permit out-chan f args)))))
+    ;; return `out-chan` which can be used to wait for results
+    out-chan))
 
-(defn do-f-after-receiving-permit-fn
-  "Return a function to call once we get a permit. Runs `f` on a background thread and returns the token when finished.
-  If `result-chan` is already closed, or already has a message written to it, returns permit immediately and skips
-  running `f`. "
-  [semaphore-chan result-chan f args]
-  (fn [permit]
-    (if (closed-or-has-message? semaphore-chan)
-      ;; channel closed, return the permit
-      (.close permit)
-      ;; If results channel is *not* yet closed...
-      ;;
-      ;; Create a new channel we'll use to keep track of whether we finished things on our own terms. If this channel
-      ;; closes/gets a message before the result-channel we'll know we finished things on our terms
-      (let [finished-chan (a/chan 1)
-            ;; and fire off a future to run the query on a separate thread.
-            futur         (future
-                            (with-open [permit permit]
-                              (try
-                                (let [result (apply f args)]
-                                  ;; if query completes, close the finished chan to release the go block below, and
-                                  ;; write the result to the result-chan
-                                  (a/close! finished-chan)
-                                  (a/put! result-chan result))
-                                ;; if we catch an Exception (shouldn't happen in a QP query, but just in case), still
-                                ;; close the finished chan, but write the Exception to the result-chan. It's ok, our
-                                ;; IMPL of Ring StreamableResponseBody will do the right thing with it.
-                                (catch Throwable e
-                                  (a/close! finished-chan)
-                                  (a/put! result-chan e)))))]
-        ;; meanwhile, schedule a go block to wait for either finished-chan or result-chan to close or get a message
-        (a/go
-          ;; chan is whichever one completes first
-          (let [[_ chan] (a/alts! [finished-chan result-chan])]
-            ;; if result-chan completes before finished-chan, either it was closed, or someone besides us sent it a
-            ;; message. Cancel the future running the request.
-            (when (= chan result-chan)
-              (future-cancel futur))
-            ;; Close the channels if they're not already closed.
-            (a/close! finished-chan)
-            (a/close! result-chan)))))))
+(defn do-after-receiving-permit
+  "Run `(apply f args)` asynchronously after receiving a permit from `semaphore-chan`. Returns a channel from which you
+  can fetch the results. Closing this channel before results are produced will cancel the function call."
+  {:style/indent 1}
+  [semaphore-chan f & args]
+  ;; check and see whether we already have a permit for `semaphore-chan`, if so, go ahead and run the function right
+  ;; away instead of waiting for *another* permit
+  (if (get *permits* semaphore-chan)
+    (do
+      (log/debug (trs "Current thread already has a permit for {0}, will not wait to acquire another" semaphore-chan))
+      (async.u/do-on-separate-thread f))
+    ;; otherwise wait for a permit
+    (apply do-after-waiting-for-new-permit semaphore-chan f args)))

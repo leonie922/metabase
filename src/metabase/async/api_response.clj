@@ -6,17 +6,28 @@
             [compojure.response :refer [Sendable]]
             [metabase.middleware.exceptions :as mw.exceptions]
             [metabase.util :as u]
-            [metabase.util.i18n :as ui18n :refer [trs]]
+            [metabase.util
+             [date :as du]
+             [i18n :as ui18n :refer [trs]]]
             [ring.core.protocols :as ring.protocols]
             [ring.util.response :as response])
   (:import clojure.core.async.impl.channels.ManyToManyChannel
-           java.io.OutputStream
+           [java.io OutputStream Writer]
+           java.util.concurrent.TimeoutException
            org.eclipse.jetty.io.EofException))
 
-(def ^:private ^:const streaming-response-keep-alive-interval-ms
+(def ^:private keepalive-interval-ms
   "Interval between sending newline characters to keep Heroku from terminating requests like queries that take a long
   time to complete."
   (* 1 1000))
+
+(def ^:private absolute-max-keepalive-ms
+  "Absolute maximum amount of time to wait for a response to return results, instead of keeping the connection open
+  forever. Normally we'll eventually give up when a connection is closed, but if someone keeps the connection open
+  forever, or if there's a bug in the API code (and `respond` is never called, or a value is never written to the
+  channel it returns) give up after 4 hours."
+  ;; 4 hours
+  (* 4 60 60 1000))
 
 ;; Handle ring response maps that contain a core.async chan in the :body key:
 ;;
@@ -25,43 +36,70 @@
 ;;
 ;; and send strings (presumibly \n) as heartbeats to the client until the real results (a seq) is received, then
 ;; stream that to the client
-(defn- write-channel-to-output-stream [chan, ^OutputStream output-stream]
-  (with-open [out (io/writer output-stream)]
-    (try
-      (loop [chunk (a/<!! chan)]
-        (cond
-          (= chunk ::keepalive)
-          (do
-            (try
-              ;; a newline padding character as it's harmless and will allow us to check if the client is connected.
-              ;; If sending this character fails because the connection is closed, the chan will then close. Newlines
-              ;; are no-ops when reading JSON which this depends upon.
-              (.write out (str \newline))
-              (.flush out)
-              (catch EofException e
-                (log/debug e (u/format-color 'yellow (trs "connection closed, canceling request")))
-                ;; close the channel so producers like the QP know they can stop what they're doing
-                (a/close! chan)))
-            (recur (a/<!! chan)))
+(defn- write-keepalive-character [^Writer out]
+  (try
+    ;; a newline padding character as it's harmless and will allow us to check if the client
+    ;; is connected. If sending this character fails because the connection is closed, the
+    ;; chan will then close. Newlines are no-ops when reading JSON which this depends upon.
+    (.write out (str \newline))
+    (.flush out)
+    true
+    (catch EofException e
+      (log/debug e (u/format-color 'yellow (trs "connection closed, canceling request")))
+      false)
+    (catch Throwable e
+      (log/error e (trs "Unexpected error writing keepalive characters"))
+      false)))
 
-          ;; An error has occurred, let the user know
-          (instance? Exception chunk)
-          (json/generate-stream (mw.exceptions/api-exception-response chunk) out)
+(defn- write-response-chunk [chunk, ^Writer out]
+  (cond
+    ;; An error has occurred, let the user know
+    (instance? Throwable chunk)
+    (json/generate-stream (:body (mw.exceptions/api-exception-response chunk)) out)
 
-          ;; We've recevied the response, write it to the output stream and we're done
-          (seqable? chunk)
-          (json/generate-stream chunk out))))))
+    ;; We've recevied the response, write it to the output stream and we're done
+    (seqable? chunk)
+    (json/generate-stream chunk out)
+
+    :else
+    (log/error (trs "Unexpected output in async API response") (class chunk))))
+
+(defn- write-channel-to-output-stream [chan, ^Writer out]
+  (a/go-loop [chunk (a/<! chan)]
+    (cond
+      (= chunk ::keepalive)
+      ;; keepalive chunk
+      (if (write-keepalive-character out)
+        (recur (a/<! chan))
+        (do
+          (a/close! chan)
+          (.close out)))
+
+      ;; nothing -- `chan` is prematurely closed
+      (nil? chunk)
+      (.close out)
+
+      ;; otherwise we got an actual response. Do this on another thread so we don't block our precious core.async
+      ;; threads doing potentially long-running I/O
+      :else
+      (future
+        (try
+          ;; chunk *might* be `nil` if the channel already go closed.
+          (write-response-chunk chunk out)
+          (finally
+            ;; should already be closed, but just to be safe
+            (a/close! chan)
+            ;; close the writer so Ring knows the response is finished
+            (.close out))))))
+  nil)
 
 
 (extend-protocol ring.protocols/StreamableResponseBody
   ManyToManyChannel
   (write-body-to-stream [chan _ ^OutputStream output-stream]
-    ;; Write the actual results on a separate thread because we don't want to waste precious core.async threads doing
-    ;; I/O. Future threadpool is unbounded but this is only being triggered by QP responses [at the time of this
-    ;; writing] so it is ultimately bounded by the number of concurrent QP requests
-    (future
-      (log/debug (u/format-color 'green (trs "starting streaming response")))
-      (write-channel-to-output-stream chan output-stream))))
+    (log/debug (u/format-color 'green (trs "starting streaming response")))
+    (write-channel-to-output-stream chan (io/writer output-stream))))
+
 
 (defn- start-async-keepalive-loop
   "Starts a go-loop that will send `::keepalive` messages to `output-chan` every second until `input-chan` either
@@ -69,50 +107,65 @@
   anywhere to write to -- the connection was canceled), closes `input-chan`; this can and is used by producers such as
   the async QP to cancel whatever they're doing."
   [input-chan output-chan]
-  ;; Start the async loop to wait for the response/write messages to the output
-  (a/go-loop []
-    ;; check whether input-chan is closed or has produced a value, or time out after a second
-    (let [[response chan] (a/alts! [input-chan (a/timeout streaming-response-keep-alive-interval-ms)])]
-      (cond
-        ;; We have a response since it's non-nil, write the results and close up, we're done
-        (some? response)
-        (do
-          ;; BTW if output-chan is closed, it's already too late, nothing else we need to do
-          (a/>! output-chan response)
-          (log/debug (u/format-color 'blue (trs "Async response finished, closing channels.")))
-          (a/close! input-chan)
-          (a/close! output-chan))
-
-        ;; if response was produced by `input-chan` but was `nil`, that means `input-chan` was unexpectedly closed. Go
-        ;; ahead and write out an Exception rather than letting it sit around forever waiting for a response that will
-        ;; never come
-        (= chan input-chan)
-        (do
-          (log/error (trs "Input channel unexpectedly closed."))
-          (a/>! output-chan (Exception. (str (trs "Input channel unexpectedly closed."))))
-          (a/close! output-chan))
-
-        ;; otherwise we've hit the one second timeout again. Write our byte & recur if output-channel is still open,
-        ;; or close `input-chan` if it's not
-        (log/debug (u/format-color 'blue (trs "Response not ready, writing one byte & sleeping...")))
-        (if (a/>! output-chan ::keepalive)
-          ;; Successfully put the message channel, wait and see if we get the response next time
+  (let [start-time-ms (System/currentTimeMillis)]
+    ;; Start the async loop to wait for the response/write messages to the output
+    (a/go-loop []
+      ;; check whether input-chan is closed or has produced a value, or time out after a second
+      (let [[response chan]                  (a/alts! [input-chan (a/timeout keepalive-interval-ms)])
+            elapsed-time-ms                  (- (System/currentTimeMillis) start-time-ms)
+            exceeded-absolute-max-keepalive? (> elapsed-time-ms absolute-max-keepalive-ms)
+            timed-out?                       (not= chan input-chan)
+            input-chan-closed?               (and (= chan input-chan)
+                                                  (nil? response))
+            should-write-keepalive-byte?     (and timed-out? (not exceeded-absolute-max-keepalive?))]
+        ;; if we hit a timeout before getting a response but haven't hit the `absolute-max-keepalive-ms` limit then
+        ;; attempt to write our byte. Recur if successful
+        (if (when should-write-keepalive-byte?
+              (log/debug (u/format-color 'blue (trs "Response not ready, writing one byte & sleeping...")))
+              (a/>! output-chan ::keepalive))
           (recur)
-          ;; If we couldn't put the message, output-chan is closed, so go ahead and close input-chan too, which will
-          ;; trigger query-cancelation in the QP (etc.)
-          (a/close! input-chan))))))
+          ;; otherwise do the appropriate thing & then we're done here
+          (try
+            (cond
+              ;; if we attempted to write a keepalive byte but `>!` returned `nil`, that means output-chan is closed.
+              ;; Log a message, and the `finally` block will handle closing everything
+              should-write-keepalive-byte?
+              (log/debug (trs "Output chan closed, canceling keepalive request."))
+
+              ;; We have a response since it's non-nil, write the results, we're done
+              (some? response)
+              (do
+                ;; BTW if output-chan is closed, it's already too late, nothing else we need to do
+                (a/>! output-chan response)
+                (log/debug (u/format-color 'blue (trs "Async response finished, closing channels."))))
+
+              ;; Otherwise if we've been waiting longer than `absolute-max-keepalive-ms` it's time to call it quits
+              exceeded-absolute-max-keepalive?
+              (a/>! output-chan (TimeoutException. (str (trs "No response after waiting {0}. Canceling request."
+                                                             (du/format-milliseconds absolute-max-keepalive-ms)))))
+
+              ;; if input-chan was unexpectedly closed log a message to that effect and return an appropriate error
+              ;; rather than letting people wait forever
+              input-chan-closed?
+              (do
+                (log/error (trs "Input channel unexpectedly closed."))
+                (a/>! output-chan (InterruptedException. (str (trs "Input channel unexpectedly closed."))))))
+            (finally
+              (a/close! output-chan)
+              (a/close! input-chan))))))))
 
 (defn- async-keepalive-chan [input-chan]
   ;; Output chan only needs to hold on to the last message it got, for example no point in writing multiple `\n`
   ;; characters if the consumer didn't get a chance to consume them, and no point writing `\n` before writing the
   ;; actual response
   (let [output-chan (a/chan (a/sliding-buffer 1))]
+    (log/debug (trs "Opened async keepalive chan") output-chan) ; NOCOMMIT
     (start-async-keepalive-loop input-chan output-chan)
     output-chan))
 
 (defn- async-keepalive-response [input-chan]
   (assoc (response/response (async-keepalive-chan input-chan))
-    :content-type "applicaton/json"))
+    :content-type "applicaton/json; charset=utf-8"))
 
 (extend-protocol Sendable
   ManyToManyChannel

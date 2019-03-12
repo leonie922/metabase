@@ -10,13 +10,19 @@
   will initially contain 15 permits. Each incoming request will asynchronously read from the channel until it acquires
   a permit, then put it back when it finishes."
   (:require [clojure.core.async :as a]
-            [clojure.core.async.impl.protocols :as async.protocols]
-            [metabase.async.semaphore-channel :as semaphore-channel]
-            [metabase.models.setting :refer [defsetting]]
-            [metabase.util.i18n :refer [trs]]
+            [clojure.tools.logging :as log]
             [metabase
              [query-processor :as qp]
-             [util :as u]]))
+             [util :as u]]
+            [metabase.api.common :as api]
+            [metabase.async
+             [semaphore-channel :as semaphore-channel]
+             [util :as async.u]]
+            [metabase.models.setting :refer [defsetting]]
+            [metabase.query-processor.interface :as qpi]
+            [metabase.util.i18n :refer [trs]]
+            [schema.core :as s])
+  (:import clojure.core.async.impl.channels.ManyToManyChannel))
 
 (defsetting max-simultaneous-queries-per-db
   (trs "Maximum number of simultaneous queries to allow per connected Database.")
@@ -24,10 +30,9 @@
   :default 15)
 
 
-
 (defonce ^:private db-semaphore-channels (atom {}))
 
-(defn- db-semaphore-channel
+(defn- fetch-db-semaphore-channel
   "Fetch the counting semaphore channel for a Database, creating it if not already created."
   [database-or-id]
   (let [id (u/get-id database-or-id)]
@@ -44,21 +49,12 @@
        ;; return the newly created channel
        new-ch))))
 
-
-
-
 (defn- do-async
   "Execute `f` asynchronously, waiting to receive a permit from `db`'s semaphore channel before proceeding. Returns the
   results in a channel."
   [db f & args]
-  (let [semaphore-chan (db-semaphore-channel db)
-        ;; open a channel to receive the result
-        result-chan    (a/chan 1)
-        do-f           (semaphore-channel/do-f-after-receiving-permit-fn semaphore-chan result-chan f args)]
-    (a/go
-      (do-f (a/<! semaphore-chan)))
-    ;; return a channel that can be used to get the response, and one that can be used to cancel the request
-    result-chan))
+  (let [semaphore-chan (fetch-db-semaphore-channel db)]
+    (apply semaphore-channel/do-after-receiving-permit semaphore-chan f args)))
 
 (defn process-query
   "Async version of `metabase.query-processor/process-query`. Runs query asynchronously, and returns a `core.async`
@@ -87,3 +83,32 @@
   cancel the query."
   [user query]
   (do-async (:database query) qp/process-query-without-save! user query))
+
+
+;;; ------------------------------------------------ Result Metadata -------------------------------------------------
+
+(defn- transform-result-metadata-query-results [{:keys [status], :as results}]
+  (when (= status :failed)
+    (log/error (trs "Error running query to determine Card result metadata:")
+               (u/pprint-to-str 'red results)))
+  (get-in results [:data :results_metadata :columns]))
+
+(s/defn result-metadata-for-query-async :- ManyToManyChannel
+  "Fetch the results metadata for a `query` by running the query and seeing what the QP gives us in return.
+   This is obviously a bit wasteful so hopefully we can avoid having to do this. Returns a channel to get the
+   results."
+  [query]
+  (let [out-chan (a/chan 1 (map transform-result-metadata-query-results))]
+    ;; set up a pipe to get the async QP results and pipe them thru to out-chan
+    (async.u/single-value-pipe
+     (binding [qpi/*disable-qp-logging* true]
+       (process-query-without-save!
+        api/*current-user-id*
+        ;; for purposes of calculating the actual Fields & types returned by this query we really only need the first
+        ;; row in the results
+        (-> query
+            (assoc-in [:constrains :max-results] 1)
+            (assoc-in [:constrains :max-results-bare-rows] 1))))
+     out-chan)
+    ;; return out-chan
+    out-chan))

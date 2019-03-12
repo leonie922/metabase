@@ -307,9 +307,8 @@
                       :is-endpoint? true)
        (~method ~route []
         (fn ~args
-          (auto-parse ~args
-            ~@validate-param-calls
-            (wrap-response-if-needed (do ~@body))))))))
+          ~@validate-param-calls
+          ~@body)))))
 
 (defn- namespace->api-route-fns
   "Return a sequence of all API endpoint functions defined by `defendpoint` in a namespace."
@@ -504,3 +503,17 @@
        (do
          (reconcile-position-for-collection! old-collection-id old-position nil)
          (reconcile-position-for-collection! new-collection-id nil new-position))))))
+
+(defmacro catch-and-raise
+  "Catches exceptions thrown in `body` and passes them along to the `raise` function. Meant for writing async
+  endpoints.
+
+  You only need to `raise` Exceptions that happen outside the initial thread of the API endpoint function; things like
+  normal permissions checks are usually done within the same thread that called the endpoint, meaning the middleware
+  that catches Exceptions will automatically handle them."
+  {:style/indent 1}
+  [raise & body]
+  `(try
+     ~@body
+     (catch Throwable e#
+       (~raise e#))))

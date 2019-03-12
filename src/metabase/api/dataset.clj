@@ -19,7 +19,9 @@
              [export :as ex]
              [i18n :refer [trs tru]]
              [schema :as su]]
-            [schema.core :as s]))
+            [schema.core :as s])
+  (:import clojure.core.async.impl.channels.ManyToManyChannel))
+
 
 ;;; -------------------------------------------- Running a Query Normally --------------------------------------------
 
@@ -45,8 +47,7 @@
   (let [source-card-id (query->source-card-id query)
         options        {:executed-by api/*current-user-id*, :context :ad-hoc,
                         :card-id     source-card-id,        :nested? (boolean source-card-id)}]
-    (a/go
-      (respond (a/<! (qp.async/process-query-and-save-with-max! query options))))))
+    (respond (qp.async/process-query-and-save-with-max! query options))))
 
 
 ;;; ----------------------------------- Downloading Query Results in Other Formats -----------------------------------
@@ -96,20 +97,37 @@
       (map (comp (swap-date-columns date-indexes) vec) rows)
       rows)))
 
-(defn as-format
-  "Return a response containing the RESULTS of a query in the specified format."
+(defn- as-format
+  "Return a response containing the `results` of a query in the specified format."
   {:style/indent 1, :arglists '([export-format results])}
-  [export-format {{:keys [columns rows cols]} :data, :keys [status], :as response}]
+  [export-format {{:keys [columns rows cols]} :data, :keys [status], :as response} respond]
   (api/let-404 [export-conf (ex/export-formats export-format)]
     (if (= status :completed)
       ;; successful query, send file
-      {:status  200
-       :body    ((:export-fn export-conf) columns (maybe-modify-date-values cols rows))
-       :headers {"Content-Type"        (str (:content-type export-conf) "; charset=utf-8")
-                 "Content-Disposition" (str "attachment; filename=\"query_result_" (du/date->iso-8601) "." (:ext export-conf) "\"")}}
+      (respond
+       {:status  200
+        :body    ((:export-fn export-conf) columns (maybe-modify-date-values cols rows))
+        :headers {"Content-Type"        (str (:content-type export-conf) "; charset=utf-8")
+                  "Content-Disposition" (str "attachment; filename=\"query_result_" (du/date->iso-8601) "." (:ext export-conf) "\"")}})
       ;; failed query, send error message
-      {:status 500
-       :body   (:error response)})))
+      (respond
+       {:status 500
+        :body   (:error response)}))))
+
+(s/defn as-format-async
+  "Write the results of an async query to API `respond` or `raise` functions in `export-format`. `in-chan` should be a
+  core.async channel that can be used to fetch the results of the query."
+  {:style/indent 3}
+  [export-format :- ExportFormat, respond :- (s/pred fn?), raise :- (s/pred fn?), in-chan :- ManyToManyChannel]
+  (a/go
+    (try
+      (let [results (a/<! in-chan)]
+        (as-format export-format results respond))
+      (catch Throwable e
+        (raise e))
+      (finally
+        (a/close! in-chan))))
+  nil)
 
 (def export-format-regex
   "Regex for matching valid export formats (e.g., `json`) for queries.
@@ -118,19 +136,20 @@
      (api/defendpoint POST [\"/:export-format\", :export-format export-format-regex]"
   (re-pattern (str "(" (str/join "|" (keys ex/export-formats)) ")")))
 
-(api/defendpoint POST ["/:export-format", :export-format export-format-regex]
+(api/defendpoint-async POST ["/:export-format", :export-format export-format-regex]
   "Execute a query and download the result data as a file in the specified format."
-  [export-format query]
+  [{{:keys [export-format query]} :params} respond raise]
   {query         su/JSONString
    export-format ExportFormat}
   (let [{:keys [database] :as query} (json/parse-string query keyword)]
     (when-not (= database database/virtual-id)
       (api/read-check Database database))
-    (as-format export-format
-      (qp/process-query-and-save-execution! (-> query
-                                                (dissoc :constraints)
-                                                (assoc-in [:middleware :skip-results-metadata?] true))
-        {:executed-by api/*current-user-id*, :context (export-format->context export-format)}))))
+    (as-format-async export-format respond raise
+      (qp.async/process-query-and-save-execution!
+       (-> query
+           (dissoc :constraints)
+           (assoc-in [:middleware :skip-results-metadata?] true))
+       {:executed-by api/*current-user-id*, :context (export-format->context export-format)}))))
 
 
 ;;; ------------------------------------------------ Other Endpoints -------------------------------------------------

@@ -1,39 +1,104 @@
-(ns metabase.async.semaphore-channel-test)
+(ns metabase.async.semaphore-channel-test
+  (:require [clojure.core.async :as a]
+            [expectations :refer [expect]]
+            [metabase.async.semaphore-channel :as semaphore-channel]
+            [metabase.test.util.async :as tu.async]
+            [metabase.async.util :as async.u])
+  (:import java.io.Closeable))
+
+(defn- get-permits [semaphore-chan n]
+  (loop [acc [], n n]
+    (println @#'semaphore-channel/*permits*)
+    (if-not (pos? n)
+      acc
+      (let [[permit] (a/alts!! [semaphore-chan (a/timeout 100)])]
+        (assert permit)
+        (recur (conj acc permit) (dec n))))))
+
+;; check that a semaphore channel only gives out the correct number of permits
+(expect
+  nil
+  (tu.async/with-open-channels [semaphore-chan (semaphore-channel/semaphore-channel 3)]
+    (let [_ (get-permits semaphore-chan 3)]
+      (first (a/alts!! [semaphore-chan (a/timeout 100)])))))
+
+;; check that when a permit is returned, whoever was waiting will get their permit
+(expect
+  "Permit #4"
+  (tu.async/with-open-channels [semaphore-chan (semaphore-channel/semaphore-channel 3)]
+    (let [[permit-1] (get-permits semaphore-chan 3)]
+      (.close permit-1)
+      (some-> (first (a/alts!! [semaphore-chan (a/timeout 100)])) str))))
+
+;; if we are true knuckleheads and *lose* a permit it should eventually get garbage collected and returned to the pool
+(expect
+  "Permit #4"
+  (tu.async/with-open-channels [semaphore-chan (semaphore-channel/semaphore-channel 3)]
+    (get-permits semaphore-chan 3)
+    (System/gc)
+    (some-> (first (a/alts!! [semaphore-chan (a/timeout 100)])) str)))
 
 
-;; TODO
+;;; ------------------------------------------- do-after-receiving-permit --------------------------------------------
 
-;; NOCOMMIT
-#_(defn- y [c]
-  (println "[1] in another function" (a/<!! c)))
+;; If we already have a permit, code should be smart enough to skip getting another one
+(expect
+ {:first-permit "Permit #1", :second-permit "Permit #1", :same? true}
+ (tu.async/with-open-channels [semaphore-chan (semaphore-channel/semaphore-channel 1)
+                               output-chan    (a/chan 1)]
+   (let [existing-permit #(get @#'semaphore-channel/*permits* semaphore-chan)]
+     (semaphore-channel/do-after-receiving-permit semaphore-chan
+       (fn []
+         (let [first-permit (existing-permit)]
+           (semaphore-channel/do-after-receiving-permit semaphore-chan
+             (fn []
+               (let [second-permit (existing-permit)]
+                 (a/>!! output-chan {:first-permit  (str first-permit)
+                                     :second-permit (str second-permit)
+                                     :same?         (identical? first-permit second-permit)}))))))))
+   (first (a/alts!! [output-chan (a/timeout 100)]))))
 
-#_(defn- x []
-  (let [c (semaphore-channel 3)]
-    (y c)
-    (try
-      (with-open [permit (a/<!! c)]
-        (println "[2] with-open" permit) ; NOCOMMIT
-        )
-      (with-open [permit (a/<!! c)]
-        (println "[3] with-open" permit) ; NOCOMMIT
-        )
-      (println "[4] in same fn" (a/<!! c))
-      (println "[5] in same fn" (a/<!! c))
-      (let [[result] (a/alts!! [c] :default ::not-available)]
-        (println "[6] in same fn [poll]" result)
-        (assert (= result ::not-available)))
-      (System/gc)
-      (let [[result] (a/alts!! [c] :default ::not-available)]
-        (println "[7] in same fn [poll]" result)
-        (assert (not= result ::not-available)))
-      (let [p8 (a/<!! c)
-            _ (println "[8] let-bound" p8)
-            p9 (a/<!! c)
-            _ (println "[9] let-bound" p9)]
-        (System/gc)
-        (let [[result] (a/alts!! [c] :default ::not-available)]
-          (println "[10] in same fn [poll]" result)
-          (assert (not= result ::not-available))))
+;; Make sure `do-f-with-permit` returns the permit when functions finish normally
+(expect
+  {:permit-returned? true, :result ::value}
+  (let [open?  (atom false)
+        permit (reify
+                 Closeable
+                 (close [this]
+                   (reset! open? false)))]
+    (tu.async/with-open-channels [output-chan (a/chan 1)]
+      (#'semaphore-channel/do-f-with-permit permit output-chan (constantly ::value))
+      (let [[result] (a/alts!! [output-chan (a/timeout 100)])]
+        {:permit-returned? (not @open?), :result result}))))
 
+;; If `f` throws an Exception, `permit` should get returned, and Exception should get returned as the result
+(expect
+  {:permit-returned? true, :result "FAIL"}
+  (let [open?  (atom false)
+        permit (reify
+                 Closeable
+                 (close [this]
+                   (reset! open? false)))]
+    (tu.async/with-open-channels [output-chan (a/chan 1)]
+      (#'semaphore-channel/do-f-with-permit permit output-chan (fn []
+                                                                 (throw (Exception. "FAIL"))))
+      (let [[result] (a/alts!! [output-chan (a/timeout 100)])]
+        {:permit-returned? (not @open?), :result (when (instance? Exception result)
+                                                   (.getMessage ^Exception result))}))))
 
-      (finally (a/close! c)))))
+;; If `output-chan` is closed early, permit should still get returned, but there's nowhere to write the result to so
+;; it should be `nil`
+(expect
+  {:permit-returned? true, :result nil}
+  (let [open?  (atom false)
+        permit (reify
+                 Closeable
+                 (close [this]
+                   (reset! open? false)))]
+    (tu.async/with-open-channels [output-chan (a/chan 1)]
+      (#'semaphore-channel/do-f-with-permit permit output-chan (fn []
+                                                                 (Thread/sleep 100)
+                                                                 ::value))
+      (a/close! output-chan)
+      (let [[result] (a/alts!! [output-chan (a/timeout 500)])]
+        {:permit-returned? (not @open?), :result result}))))

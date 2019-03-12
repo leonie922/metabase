@@ -53,7 +53,12 @@
   creating one-off web servers for tests and REPL usage."
   ^Server [handler options]
   (doto ^Server (#'ring-jetty/create-server (assoc options :async? true))
-    (.setHandler (#'ring-jetty/async-proxy-handler handler 0))))
+    (.setHandler (#'ring-jetty/async-proxy-handler
+                  handler
+                  ;; if any API endpoint functions aren't at the very least returning a channel to fetch the results
+                  ;; later after 30 seconds we're in serious trouble. Kill the request.
+                  (or (config/config-int :mb-jetty-async-response-timeout)
+                      (* 30 1000))))))
 
 (defn start-web-server!
   "Start the embedded Jetty web server. Returns `:started` if a new server was started; `nil` if there was already a
